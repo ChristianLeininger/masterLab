@@ -10,15 +10,15 @@ import time
 import numpy as np  
 import threading
 import wandb
-
+import wandb.plot as wplot
 
 from datetime import datetime
 from pathlib import Path
 
 from memory import VectorizedReplayBuffer
-from dqn_agent import DQNAgent
+from dqn_agent import DQNAgent, DoubleDQNAgent
 from utils import set_seed, create_annotated_video
-
+from utils import get_agent, add_action_dist
 
 
 
@@ -54,12 +54,15 @@ def main(cfg: DictConfig):
     logger.setLevel(logging.INFO)
     handler = logging.StreamHandler()
     logger.addHandler(handler)
+    log_file_path = os.path.join(experiment_path, "logs")
+    Path(log_file_path).mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_file_path + "/log.log")
+    logger.addHandler(file_handler)
     env_name = cfg.env.name
     num_processes = cfg.env.num_processes
     total_episodes = cfg.env.total_episodes
-    buffer_size = cfg.env.buffer_size
+    buffer_size = cfg.agent.buffer_size
     cfg.agent.updates = cfg.env.num_processes
-     
     # Initialize Lunarlander environment and policy
     env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_processes)])
 
@@ -68,7 +71,11 @@ def main(cfg: DictConfig):
     env.action_space.seed(cfg.env.seed)
     cfg.agent.action_dim = int(env.action_space[0].n)
     cfg.agent.state_dim = env.observation_space.shape[1]
-    agent = DQNAgent(cfg=cfg.agent)
+    # Initialize agent
+    agent, run_name = get_agent(cfg, day, current_time)
+    
+    
+
     # Initialize replay memory
     memory = VectorizedReplayBuffer(capacity=buffer_size, state_dim=cfg.agent.state_dim, logger=logger)
      # Create a unique run name based on hyperparameters and current time
@@ -76,12 +83,12 @@ def main(cfg: DictConfig):
 
     # Initialize wandb with a run name and a group name
     if  cfg.track:
-        
-        run_name = f"{current_time}_lr={cfg.agent.learning_rate}_eps={cfg.agent.epsilon_start}_decay={cfg.agent.epsilon_decay}"
+        job_type = f"batch_size_{cfg.agent.batch_size}_buffer_size_{buffer_size}_updates_{cfg.agent.updates}"
         wandb_run = wandb.init(project="lunar-lander", 
                             config=cfg, 
                             name=run_name, 
-                            group="LunarLander-Experiments")
+                            job_type= job_type,
+        )
         
         # Create an artifact for the code
         code_artifact = wandb.Artifact(
@@ -104,29 +111,36 @@ def main(cfg: DictConfig):
         # Log the artifact
         wandb_run.log_artifact(code_artifact)
     
-    agent.q_network
     start = time.time()
     mean_loss = deque(maxlen=100)
     # start episode
     # mean reward of 100 episodes
-    create_annotated_video(agent=agent, env_name=env_name, path=experiment_path, num_episodes=1)
+    create_annotated_video(agent=agent, env_name=env_name, path=experiment_path, sec_passed=0, num_episodes=1)
     evaluate_agent(agent, env_name, logger, 0)
+    
+    action_dist = [1 for _ in range(cfg.agent.action_dim)]
     mean_reward = deque(maxlen=100)
     for episode in range(1, total_episodes + 1):
         # reset environment
         states, _  = env.reset(seed=cfg.env.seed)
         # import pdb; pdb.set_trace()
         total_reward = [0 for _ in range(num_processes)]
+        steps = 0
         while True:
+            steps += 1
             # Epsilon-greedy action selection
             if agent.epsilon < np.random.rand():
                 actions = agent.select_action(states)
                 
+                
             else:
                 actions = env.action_space.sample()
+             
             
+            action_dist = add_action_dist(actions=actions, action_dist=action_dist)
+            # normalize action distribution
+            action_dist_normalized = [action / sum(action_dist) for action in action_dist]
             next_states, rewards, dones, truncs, _ = env.step(actions)
-            
             if episode >= cfg.agent.start_learning_episode:
                 # Update agent
                 batch = memory.sample(cfg.agent.batch_size)
@@ -137,15 +151,19 @@ def main(cfg: DictConfig):
             states = next_states
             total_reward[0] += rewards[0]
             # end episode if done is true for any of the processes
-            if np.any(dones):
+            if np.any(dones) or steps > 200:
                 mean_reward.append(total_reward[0])
                 break
                 # import pdb; pdb.set_trace()
         if episode % 20 == 0:
+            passed = time.time() - start
             if cfg.track:
                 wandb.log({"mean_reward": np.mean(mean_reward), "epsilon": agent.epsilon, "loss": loss, "mean loss": np.mean(mean_loss), "memory_size": memory.size})
+                for idx, a in  enumerate(action_dist_normalized):
+                    wandb.log({f"action_dist_{idx}": a})
+                
             logger.info(f"Episode: {episode}, mean Reward {np.mean(mean_reward):.2f}  Reward: {total_reward[0]:.2f}, Epsilon: {agent.epsilon:.2f}, memory size {memory.size} Time: {time.time() - start:.2f}")
-            create_annotated_video(agent=agent, env_name=env_name, path=experiment_path, num_episodes=episode)
+            create_annotated_video(agent=agent, env_name=env_name, path=experiment_path, sec_passed=passed, num_episodes=episode)
             eval_thread = threading.Thread(target=evaluate_agent, args=(agent, cfg.env.name, logger, episode))
             eval_thread.start()
             
